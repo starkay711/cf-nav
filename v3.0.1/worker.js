@@ -7,7 +7,8 @@
  *
  * KV Keys used:
  *   config      → JSON navigation configuration
- *   admin       → { username, passwordHash, salt }
+ *   admin       → { username, passwordHash, salt }   （站点所有者，注册流程永不覆盖）
+ *   users       → { list: [{ username, passwordHash, salt }] }  注册账号
  *   reg_config  → { mode, inviteCode }
  *   bg_image    → base64 background image (optional)
  *   visits      → { count } visit counter
@@ -22,14 +23,15 @@
 // 1. CONSTANTS & DEFAULT DATA
 // ─────────────────────────────────────────────────────────
 
-const TOKEN_TTL = 86400 * 7; // 7 days in seconds
-const LOGIN_MAX_ATTEMPTS = 5;
-const LOGIN_LOCK_SECONDS = 300; // 5 minutes
+var TOKEN_TTL = 86400 * 7; // 7 days in seconds
+var LOGIN_MAX_ATTEMPTS = 5;
+var LOGIN_LOCK_SECONDS = 300; // 5 minutes
 
 const DEFAULT_CONFIG = {
   siteTitle: '我的导航',
   favicon: '🏠',
   theme: 'light',
+  openTarget: '_self', // 默认在当前页面直接打开
   background: { type: 'default', value: '', overlay: 0, blur: false },
   searchEngine: 'google',
   fontSettings: {
@@ -46,6 +48,12 @@ const DEFAULT_CONFIG = {
     greetings: {
       night: '', dawn: '', morning: '', noon: '', afternoon: '', evening: '', night2: '',
     },
+  },
+  weatherSettings: {
+    show: true, city: '北京',
+  },
+  calendarSettings: {
+    show: true,
   },
   engines: [
     { id: 'google', name: 'Google', url: 'https://www.google.com/search?q=' },
@@ -116,7 +124,7 @@ export default {
     }
 
     try {
-      if (path === '/api/status')         return apiStatus(env);
+      if (path === '/api/status')         return apiStatus(request, env);
       if (path === '/api/setup'           && request.method === 'POST') return apiSetup(request, env);
       if (path === '/api/login'           && request.method === 'POST') return apiLogin(request, env);
       if (path === '/api/logout'          && request.method === 'POST') return apiLogout(request, env);
@@ -144,25 +152,90 @@ export default {
 // 3. AUTH API HANDLERS
 // ─────────────────────────────────────────────────────────
 
-async function apiStatus(env) {
+async function apiStatus(request, env) {
   const [admin, regConfig, visits] = await Promise.all([
     env.NAV_KV.get('admin', 'json'),
     env.NAV_KV.get('reg_config', 'json'),
     env.NAV_KV.get('visits', 'json'),
   ]);
-  return jsonResponse({
+  const mode = (regConfig || { mode: 'closed' }).mode || 'closed';
+  const out = {
     initialized:    !!admin,
-    registerMode:   (regConfig || { mode: 'closed' }).mode,
-    requireInvite:  (regConfig || { mode: 'closed' }).mode === 'invite',
+    registerMode:   mode,
+    requireInvite:  mode === 'invite',
     visitCount:     (visits || { count: 0 }).count,
-  });
+  };
+
+  // FIX: 邀请码只对已登录的「所有者」回显。
+  // 原实现前端 loadRegConfig() 拿不到 inviteCode，导致后台「注册权限」里邀请码永远空白，
+  // 管理员随手点一次「保存注册设置」就会把已生效的邀请码覆盖成空字符串，所有邀请码立即失效。
+  const session = await getSession(request, env);
+  if (session && admin && session.username === admin.username) {
+    out.isOwner = true;
+    out.inviteCode = (regConfig && regConfig.inviteCode) || '';
+  } else if (session) {
+    out.isOwner = false;
+  }
+  return jsonResponse(out);
+}
+
+// ── 账号体系 ──
+// FIX: 原实现只有一个 admin 槽位，「开放注册 / 邀请码注册」会直接 put('admin', ...) 覆盖所有者，
+// 结果是谁最后注册谁就成为唯一管理员，原管理员被彻底踢出且无法找回。
+// 现在：admin = 站点所有者（永不被注册覆盖）；其余注册账号存放在 users.list 中。
+async function getOwner(env) {
+  return await env.NAV_KV.get('admin', 'json');
+}
+
+async function getUserList(env) {
+  const users = await env.NAV_KV.get('users', 'json');
+  return (users && Array.isArray(users.list)) ? users.list : [];
+}
+
+async function findAccount(env, username) {
+  const owner = await getOwner(env);
+  if (owner && owner.username === username) return { ...owner, isOwner: true };
+  const hit = (await getUserList(env)).find(u => u.username === username);
+  return hit ? { ...hit, isOwner: false } : null;
+}
+
+async function accountExists(env, username) {
+  return !!(await findAccount(env, username));
+}
+
+async function appendUser(env, username, hash, salt) {
+  const users = (await env.NAV_KV.get('users', 'json')) || { list: [] };
+  if (!Array.isArray(users.list)) users.list = [];
+  users.list.push({ username, passwordHash: hash, salt });
+  await env.NAV_KV.put('users', JSON.stringify(users));
+}
+
+// FIX: 改密码必须作用于「当前登录账号」。原实现无论谁登录都在改 admin 的密码，
+// 注册进来的普通用户可以借此直接接管所有者账号。
+async function updateAccountPassword(env, username, newPassword) {
+  const { hash, salt } = await hashPassword(newPassword);
+  const owner = await getOwner(env);
+  if (owner && owner.username === username) {
+    owner.passwordHash = hash;
+    owner.salt = salt;
+    await env.NAV_KV.put('admin', JSON.stringify(owner));
+    return true;
+  }
+  const users = (await env.NAV_KV.get('users', 'json')) || { list: [] };
+  if (!Array.isArray(users.list)) users.list = [];
+  const target = users.list.find(u => u.username === username);
+  if (!target) return false;
+  target.passwordHash = hash;
+  target.salt = salt;
+  await env.NAV_KV.put('users', JSON.stringify(users));
+  return true;
 }
 
 async function apiSetup(request, env) {
   const body = await request.json();
   const { username, password, inviteCode } = body;
 
-  const existing = await env.NAV_KV.get('admin', 'json');
+  const existing = await getOwner(env);
   if (existing) {
     const regConfig = await env.NAV_KV.get('reg_config', 'json') || { mode: 'closed', inviteCode: '' };
     if (regConfig.mode === 'closed') {
@@ -174,8 +247,11 @@ async function apiSetup(request, env) {
       }
     }
     if (!username || !password) return jsonResponse({ error: '用户名和密码不能为空' }, 400);
+    if (await accountExists(env, username)) {
+      return jsonResponse({ error: '该用户名已被占用' }, 409);
+    }
     const { hash, salt } = await hashPassword(password);
-    await env.NAV_KV.put('admin', JSON.stringify({ username, passwordHash: hash, salt }));
+    await appendUser(env, username, hash, salt);   // 不再覆盖 admin
     const token = await createSession(env, username);
     return jsonResponse({ token, username });
   }
@@ -203,19 +279,25 @@ async function apiLogin(request, env) {
     await env.NAV_KV.delete(failKey);
   }
 
-  const admin = await env.NAV_KV.get('admin', 'json');
-  if (!admin) return jsonResponse({ error: '系统未初始化' }, 400);
-  const { hash } = await hashPassword(password, admin.salt || '');
-  if (admin.username !== username || admin.passwordHash !== hash) {
+  const registerFail = async () => {
     const fails = await env.NAV_KV.get(failKey, 'json') || { count: 0 };
     fails.count += 1;
     fails.until = Date.now() + LOGIN_LOCK_SECONDS * 1000;
-    await env.NAV_KV.put(failKey, JSON.stringify(fails));
+    // FIX: 补上 expirationTtl。原来这个 key 永不过期，会在 KV 里无限堆积垃圾键。
+    await env.NAV_KV.put(failKey, JSON.stringify(fails), { expirationTtl: LOGIN_LOCK_SECONDS });
     return jsonResponse({ error: '用户名或密码错误' }, 401);
-  }
+  };
+
+  if (!(await getOwner(env))) return jsonResponse({ error: '系统未初始化' }, 400);
+  const account = await findAccount(env, username);
+  if (!account) return registerFail();
+
+  const { hash } = await hashPassword(password, account.salt || '');
+  if (account.passwordHash !== hash) return registerFail();
+
   await env.NAV_KV.delete(failKey);
   const token = await createSession(env, username);
-  return jsonResponse({ token, username });
+  return jsonResponse({ token, username, isOwner: !!account.isOwner });
 }
 
 async function apiLogout(request, env) {
@@ -242,26 +324,21 @@ async function apiGetConfig(env) {
 }
 
 async function apiPutConfig(request, env) {
-  const authErr = await requireAuth(request, env);
-  if (authErr) return authErr;
+  const session = await getSession(request, env);
+  if (!session) return jsonResponse({ error: 'Token 无效或已过期，请重新登录' }, 401);
 
   const body = await request.json();
   if (body._regConfig) {
+    const ownerErr = await requireOwner(request, env);
+    if (ownerErr) return ownerErr;
     const { mode, inviteCode } = body._regConfig;
     await env.NAV_KV.put('reg_config', JSON.stringify({ mode, inviteCode: inviteCode || '' }));
     delete body._regConfig;
   }
   if (body._changePassword) {
     const { newPassword } = body._changePassword;
-    if (newPassword) {
-      const admin = await env.NAV_KV.get('admin', 'json');
-      if (admin) {
-        const { hash, salt } = await hashPassword(newPassword);
-        admin.passwordHash = hash;
-        admin.salt = salt;
-        await env.NAV_KV.put('admin', JSON.stringify(admin));
-      }
-    }
+    // FIX: 只改「当前登录账号」的密码，原实现任何登录用户都在改 admin 的密码
+    if (newPassword) await updateAccountPassword(env, session.username, newPassword);
     delete body._changePassword;
   }
   if (Object.keys(body).length > 0) {
@@ -298,8 +375,8 @@ async function apiGetBg(env) {
 }
 
 async function apiReset(request, env) {
-  const authErr = await requireAuth(request, env);
-  if (authErr) return authErr;
+  const ownerErr = await requireOwner(request, env);
+  if (ownerErr) return ownerErr;
 
   await env.NAV_KV.put('config', JSON.stringify(DEFAULT_CONFIG));
   return jsonResponse({ ok: true });
@@ -332,26 +409,37 @@ async function apiManifest(env) {
 
 function apiServiceWorker() {
   const sw = `
-const CACHE='cf-nav-v1';
+const CACHE='cf-nav-v2';
+const API_RE=new RegExp('^/api/');
 self.addEventListener('install',e=>{self.skipWaiting()});
-self.addEventListener('activate',e=>{e.waitUntil(clients.claim())});
+self.addEventListener('activate',e=>{
+  e.waitUntil((async()=>{
+    const keys=await caches.keys();
+    for(const k of keys){ if(k!==CACHE) await caches.delete(k); }
+    await clients.claim();
+  })());
+});
 self.addEventListener('fetch',e=>{
-  if(e.request.method!=='GET')return;
-  e.respondWith(
-    caches.open(CACHE).then(cache=>
-      cache.match(e.request).then(cached=>{
-        const fetchPromise=fetch(e.request).then(resp=>{
-          if(resp.ok)cache.put(e.request,resp.clone());
-          return resp;
-        }).catch(()=>cached);
-        return cached||fetchPromise;
-      })
-    )
-  );
+  if(e.request.method!=='GET') return;
+  const url=new URL(e.request.url);
+  if(url.origin!==self.location.origin) return;
+  if(API_RE.test(url.pathname)) return;
+  e.respondWith((async()=>{
+    const cache=await caches.open(CACHE);
+    try{
+      const resp=await fetch(e.request);
+      if(resp && resp.ok && resp.type==='basic') cache.put(e.request, resp.clone());
+      return resp;
+    }catch(err){
+      const cached=await cache.match(e.request);
+      if(cached) return cached;
+      throw err;
+    }
+  })());
 });
 `;
   return new Response(sw, {
-    headers: { 'Content-Type': 'application/javascript', 'Cache-Control': 'max-age=86400' }
+    headers: { 'Content-Type': 'application/javascript', 'Cache-Control': 'no-cache, no-store, must-revalidate' }
   });
 }
 
@@ -394,11 +482,29 @@ function extractToken(request) {
   return auth.startsWith('Bearer ') ? auth.slice(7) : null;
 }
 
+async function getSession(request, env) {
+  const token = extractToken(request);
+  if (!token) return null;
+  const session = await env.NAV_KV.get(`session:${token}`, 'json');
+  return session || null;
+}
+
 async function requireAuth(request, env) {
   const token = extractToken(request);
   if (!token) return jsonResponse({ error: '未授权' }, 401);
   const session = await env.NAV_KV.get(`session:${token}`, 'json');
   if (!session) return jsonResponse({ error: 'Token 无效或已过期，请重新登录' }, 401);
+  return null;
+}
+
+// 仅站点所有者可执行的操作（注册权限、重置配置）
+async function requireOwner(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return jsonResponse({ error: 'Token 无效或已过期，请重新登录' }, 401);
+  const owner = await getOwner(env);
+  if (!owner || owner.username !== session.username) {
+    return jsonResponse({ error: '该操作仅站点所有者可用' }, 403);
+  }
   return null;
 }
 
@@ -489,7 +595,7 @@ html{height:100%;-webkit-font-smoothing:antialiased}
   --ease:cubic-bezier(0.25,0.1,0.25,1);
   --font-size:14px;
   --font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;
-  --font-color:;
+  --font-color:var(--text);
   --font-bold:normal;
 }
 [data-theme=dark]{
@@ -742,6 +848,25 @@ body.custom-font-color{color:var(--font-color)}
 .clock-greeting{
   font-size:.92rem;color:var(--muted);margin-top:6px;
 }
+.weather-cal-row{
+  display:flex;justify-content:center;align-items:center;gap:24px;
+  margin-bottom:24px;width:100%;flex-wrap:wrap;
+}
+.weather-box{
+  display:flex;align-items:center;gap:6px;
+  font-size:.85rem;color:var(--muted);
+  background:var(--surface);padding:8px 16px;border-radius:999px;
+  border:1px solid var(--border);
+}
+.weather-box .w-icon{font-size:1.2rem}
+.weather-box .w-temp{font-weight:600;color:var(--text)}
+.weather-box .w-city{font-size:.78rem;margin-left:2px}
+.calendar-box{
+  font-size:.85rem;color:var(--muted);
+  background:var(--surface);padding:8px 16px;border-radius:999px;
+  border:1px solid var(--border);
+}
+.calendar-box .lunar{color:var(--accent);font-weight:500}
 .search-suggestions{
   position:absolute;top:100%;left:0;right:0;
   margin-top:6px;
@@ -807,6 +932,18 @@ body.custom-font-color{color:var(--font-color)}
     <div class="clock-time" id="clock-time"></div>
     <div class="clock-date" id="clock-date"></div>
     <div class="clock-greeting" id="clock-greeting"></div>
+  </div>
+
+  <div class="weather-cal-row" id="weather-cal-row">
+    <div class="weather-box" id="weather-box">
+      <span class="w-icon" id="weather-icon">☀️</span>
+      <span class="w-temp" id="weather-temp">--°</span>
+      <span class="w-city" id="weather-city">--</span>
+    </div>
+    <div class="calendar-box" id="calendar-box">
+      <span id="cal-solar">--</span>
+      <span class="lunar" id="cal-lunar"> --</span>
+    </div>
   </div>
 
   <div class="search-section">
@@ -911,7 +1048,8 @@ function faviconUrl(siteUrl) {
 
 function iconHtml(item) {
   const ico = (item.icon || '').trim();
-  if (ico.startsWith('data:')) {
+  // FIX: 自定义图标 URL（非 data:）原来会被忽略、退化成 favicon
+  if (ico.startsWith('data:') || /^https?:\\/\\//i.test(ico)) {
     return '<img src="' + escAttr(ico) + '" loading="lazy" alt=""/>';
   }
   const fav = faviconUrl(item.url || '');
@@ -962,10 +1100,13 @@ async function boot() {
   } catch(e) {
     CFG = { theme:'light', background:{type:'default'},
             engines:[{id:'google',name:'Google',url:'https://www.google.com/search?q='}],
-            searchEngine:'google', quickLinks:[], categories:[], showAdminLink:true };
+            searchEngine:'google', openTarget:'_self', quickLinks:[], categories:[], showAdminLink:true };
   }
   applyConfig();
   applyCustomCSS();
+  applyClockSettings();
+  applyWeatherSettings();
+  applyCalendarSettings();
   renderEngines();
   renderQuickLinks();
   renderCategories();
@@ -973,14 +1114,36 @@ async function boot() {
     const addCatBtn = document.getElementById('nav-add-cat-btn');
     if (addCatBtn) addCatBtn.style.display = 'block';
   }
-  document.getElementById('search-input').focus();
+  // FIX: 移动端自动 focus 会直接弹出软键盘，挡住半个屏幕
+  if (window.matchMedia('(min-width: 768px)').matches) {
+    document.getElementById('search-input').focus();
+  }
+  // FIX: 后台把主题改成「跟随系统」后能实时生效
+  if (!window.__themeMQ) {
+    window.__themeMQ = window.matchMedia('(prefers-color-scheme:dark)');
+    window.__themeMQ.addEventListener('change', () => {
+      if (CFG && CFG.theme === 'auto' && !localStorage.getItem('nav_theme')) applyConfig();
+    });
+  }
+}
+
+function resolveTheme() {
+  const cfgTheme = (CFG && CFG.theme) || 'light';
+  const auto = window.matchMedia('(prefers-color-scheme:dark)').matches ? 'dark' : 'light';
+  const fromCfg = cfgTheme === 'auto' ? auto : cfgTheme;
+  // FIX: 原来只要手动切过一次主题就永久写死在 localStorage，
+  // 之后后台无论改成深色/浅色/跟随系统，这台设备都不再理会。
+  // 现在只在「后台配置没变过」的前提下尊重手动选择，配置一变就以配置为准。
+  const saved = localStorage.getItem('nav_theme');
+  const savedSrc = localStorage.getItem('nav_theme_src');
+  if (saved && savedSrc === cfgTheme) return saved;
+  localStorage.removeItem('nav_theme');
+  localStorage.removeItem('nav_theme_src');
+  return fromCfg;
 }
 
 function applyConfig() {
-  const savedTheme = localStorage.getItem('nav_theme');
-  const theme = savedTheme || (CFG.theme==='auto'
-    ? (window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light')
-    : CFG.theme || 'light');
+  const theme = resolveTheme();
   document.documentElement.setAttribute('data-theme', theme);
   document.getElementById('theme-btn').textContent = theme==='dark'?'☀':'🌙';
 
@@ -1065,6 +1228,9 @@ document.getElementById('theme-btn').addEventListener('click', () => {
   document.documentElement.setAttribute('data-theme', next);
   document.getElementById('theme-btn').textContent = next==='dark'?'☀':'🌙';
   localStorage.setItem('nav_theme', next);
+  // FIX: 同时记下"这次手动切换是在哪个后台主题配置下做的"，
+  // 后台改了主题配置后手动选择自动失效，不再永久压住配置。
+  localStorage.setItem('nav_theme_src', (CFG && CFG.theme) || 'light');
 });
 
 function renderEngines() {
@@ -1112,13 +1278,13 @@ function closeEngineDropdown() {
 function doSearch(q) {
   q = q.trim();
   if(!q) return;
-  if(/^https?:\\/\\//.test(q) || (/^[\\w-]+\\.[\\w.-]+(\\/)?(\\S*)$/.test(q)&&!q.includes(' '))) {
-    window.location.href = q.startsWith('http') ? q : 'https://'+q;
-  } else {
-    const eng = (CFG.engines||[]).find(e=>e.id===activeEngine);
-    const url  = eng ? eng.url : 'https://www.google.com/search?q=';
-    window.open(url + encodeURIComponent(q), '_blank');
-  }
+  const isUrl = /^https?:\\/\\//i.test(q) || (/^[\\w-]+(\\.[\\w.-]+)+(\\/\\S*)?$/.test(q) && !q.includes(' '));
+  const eng = (CFG.engines||[]).find(e=>e.id===activeEngine);
+  const targetUrl = isUrl
+    ? (q.startsWith('http') ? q : 'https://' + q)
+    : ((eng ? eng.url : 'https://www.google.com/search?q=') + encodeURIComponent(q));
+
+  window.location.href = targetUrl;
 }
 document.getElementById('search-btn').addEventListener('click', () =>
   doSearch(document.getElementById('search-input').value));
@@ -1138,8 +1304,11 @@ function renderQuickLinks() {
   const section = document.getElementById('quick-section');
   if(!ql.length && !isAuthed){ section.style.display='none'; return; }
   section.style.display='';
+
+  const targetAttr = '';
+
   let html = ql.map(function(q, idx) {
-    return '<a class="quick-link glass" draggable="true" data-qlidx="' + idx + '" href="' + escAttr(safeUrl(q.url)) + '" target="_blank" rel="noopener noreferrer">' +
+    return '<a class="quick-link glass" draggable="true" data-qlidx="' + idx + '" href="' + escAttr(safeUrl(q.url)) + '"' + targetAttr + '>' +
       (isAuthed ? '<button class="item-del-btn" onclick="event.preventDefault();deleteQuickLink(' + idx + ')" title="删除">✕</button>' : '') +
       '<div class="quick-icon">' + iconHtml(q) + '</div>' +
       '<div class="quick-name">' + esc(q.name) + '</div>' +
@@ -1167,7 +1336,7 @@ document.getElementById('nq-submit').addEventListener('click', async () => {
   let url = document.getElementById('nq-url').value.trim();
   if (!name || !url) return alert('请填写名称和网址');
   if (!/^https?:\\/\\//i.test(url)) url = 'https://' + url;
-  CFG.quickLinks = CFG.quickLinks || [];
+  CFG.quickLinks = Array.isArray(CFG.quickLinks) ? CFG.quickLinks : [];
   CFG.quickLinks.push({ id: 'q_' + Date.now(), name, url });
   if (await saveNavConfig(CFG)) {
     closeNavModal('nav-quick-modal');
@@ -1180,9 +1349,11 @@ document.getElementById('nq-submit').addEventListener('click', async () => {
 function renderCategories() {
   const cats = CFG.categories || [];
   const el = document.getElementById('categories');
+  const targetAttr = '';
+
   el.innerHTML = cats.map(function(cat, cIdx) {
     const sitesHtml = (cat.sites||[]).map(function(s, sIdx) {
-      return '<a class="site-card glass" draggable="true" data-cidx="' + cIdx + '" data-sidx="' + sIdx + '" href="' + escAttr(safeUrl(s.url)) + '" target="_blank" rel="noopener noreferrer">' +
+      return '<a class="site-card glass" draggable="true" data-cidx="' + cIdx + '" data-sidx="' + sIdx + '" href="' + escAttr(safeUrl(s.url)) + '"' + targetAttr + '>' +
         (isAuthed ? '<button class="item-del-btn" onclick="event.preventDefault();deleteSite(' + cIdx + ',' + sIdx + ')" title="删除">✕</button>' : '') +
         '<div class="site-icon">' + iconHtml(s) + '</div>' +
         '<div class="site-info">' +
@@ -1253,7 +1424,7 @@ document.getElementById('nc-submit').addEventListener('click', async () => {
   const icon = document.getElementById('nc-icon').value.trim() || '📁';
   if (!name) return alert('请填写分类名称');
 
-  CFG.categories = CFG.categories || [];
+  CFG.categories = Array.isArray(CFG.categories) ? CFG.categories : [];
   CFG.categories.push({ id: 'c_' + Date.now(), name, icon, sites: [] });
 
   if (await saveNavConfig(CFG)) {
@@ -1278,8 +1449,10 @@ searchInputEl.addEventListener('input', function() {
     (s.url||'').toLowerCase().includes(q)
   ).slice(0, 8);
   if (!matches.length) { suggestionsEl.classList.remove('open'); return; }
+
+  const targetAttr = '';
   suggestionsEl.innerHTML = matches.map(s =>
-    '<a class="suggestion-item" href="' + escAttr(safeUrl(s.url)) + '" target="_blank" rel="noopener">' +
+    '<a class="suggestion-item" href="' + escAttr(safeUrl(s.url)) + '"' + targetAttr + '>' +
       '<div class="suggestion-icon">' + iconHtml(s) + '</div>' +
       '<div class="suggestion-info">' +
         '<div class="suggestion-name">' + esc(s.name) + '</div>' +
@@ -1403,6 +1576,163 @@ function applyClockOne(id, s, def) {
   el.style.textAlign = s.align || def.align;
   el.style.fontFamily= s.family || '';
   el.style.color     = s.color || '';
+}
+
+// ── Weather ──
+let weatherData = null;
+function applyWeatherSettings() {
+  const ws = (CFG && CFG.weatherSettings) || {};
+  const box = document.getElementById('weather-box');
+  if (box) box.style.display = ws.show === false ? 'none' : '';
+  const targetCity = ws.city || 'Daqing';
+  if (ws.show !== false) {
+    fetchWeather(targetCity);
+    if (window.weatherInterval) clearInterval(window.weatherInterval);
+    window.weatherInterval = setInterval(() => fetchWeather(targetCity), 30 * 60 * 1000);
+  }
+}
+const WEATHER_ICONS = {
+  '晴':'☀️','少云':'🌤️','晴间多云':'⛅','多云':'☁️','阴':'☁️',
+  '小雨':'🌧️','中雨':'🌧️','大雨':'🌧️','暴雨':'🌧️','雷阵雨':'⛈️',
+  '雪':'❄️','小雪':'🌨️','中雪':'🌨️','大雪':'🌨️','雾':'🌫️','霾':'🌫️',
+};
+function getWeatherIcon(desc) {
+  if (!desc) return '🌡️';
+  for (const [k,v] of Object.entries(WEATHER_ICONS)) { if (desc.includes(k)) return v; }
+  return '🌡️';
+}
+async function fetchWeather(city) {
+  try {
+    const res = await fetch('https://wttr.in/' + encodeURIComponent(city || 'Daqing') + '?format=j1&lang=zh');
+    const d = await res.json();
+    const cur = d.current_condition[0];
+    const descZh = (cur.lang_zh && cur.lang_zh[0] && cur.lang_zh[0].value) || cur.weatherDesc[0].value;
+    weatherData = {
+      temp: cur.temp_C + '°',
+      desc: descZh,
+      icon: getWeatherIcon(descZh),
+      city: city || '大庆',
+    };
+    updateWeather();
+  } catch(e) {
+    console.warn('天气获取失败:', e);
+    weatherData = null;
+  }
+}
+function updateWeather() {
+  const ws = (CFG && CFG.weatherSettings) || {};
+  if (weatherData) {
+    const iconEl = document.getElementById('weather-icon');
+    const tempEl = document.getElementById('weather-temp');
+    const cityEl = document.getElementById('weather-city');
+    if (iconEl) iconEl.textContent = weatherData.icon;
+    if (tempEl) tempEl.textContent = weatherData.temp;
+    if (cityEl) cityEl.textContent = weatherData.city || ws.city || '';
+  }
+}
+
+// ── Lunar Calendar ──
+const LUNAR_INFO = [0x04bd8,0x04ae0,0x0a570,0x054d5,0x0d260,0x0d950,0x16554,0x056a0,0x09ad0,0x055d2,0x04ae0,0x0a5b6,0x0a4d0,0x0d250,0x1d255,0x0b540,0x0d6a0,0x0ada2,0x095b0,0x14977,0x04970,0x0a4b0,0x0b4b5,0x06a50,0x06d40,0x1ab54,0x02b60,0x09570,0x052f2,0x04970,0x06566,0x0d4a0,0x0ea50,0x06e95,0x05ad0,0x02b60,0x186e3,0x092e0,0x1c8d7,0x0c950,0x0d4a0,0x1d8a6,0x0b550,0x056a0,0x1a5b4,0x025d0,0x092d0,0x0d2b2,0x0a950,0x0b557,0x06ca0,0x0b550,0x15355,0x04da0,0x0a5b0,0x14573,0x052b0,0x0a9a8,0x0e950,0x06aa0,0x0aea6,0x0ab50,0x04b60,0x0aae4,0x0a570,0x05260,0x0f263,0x0d950,0x05b57,0x056a0,0x096d0,0x04dd5,0x04ad0,0x0a4d0,0x0d4d4,0x0d250,0x0d558,0x0b540,0x0b6a0,0x195a6,0x095b0,0x049b0,0x0a974,0x0a4b0,0x0b27a,0x06a50,0x06d40,0x0af46,0x0ab60,0x09570,0x04af5,0x04970,0x064b0,0x074a3,0x0ea50,0x06b58,0x055c0,0x0ab60,0x096d5,0x092e0,0x0c960,0x0d954,0x0d4a0,0x0da50,0x07552,0x056a0,0x0abb7,0x025d0,0x092d0,0x0cab5,0x0a950,0x0b4a0,0x0baa4,0x0ad50,0x055d9,0x04ba0,0x0a5b0,0x15176,0x052b0,0x0a930,0x07954,0x06aa0,0x0ad50,0x05b52,0x04b60,0x0a6e6,0x0a4e0,0x0d260,0x0ea65,0x0d530,0x05aa0,0x076a3,0x096d0,0x04afb,0x04ad0,0x0a4d0,0x1d0b6,0x0d250,0x0d520,0x0dd45,0x0b5a0,0x056d0,0x055b2,0x049b0,0x0a577,0x0a4b0,0x0aa50,0x1b255,0x06d20,0x0ada0,0x14b63];
+const SOLAR_MONTH_DAYS = [31,0,31,30,31,30,31,31,30,31,30,31];
+const LUNAR_MONTH_NAMES = ['','正','二','三','四','五','六','七','八','九','十','冬','腊'];
+const LUNAR_DAY_NAMES = ['','初一','初二','初三','初四','初五','初六','初七','初八','初九','初十','十一','十二','十三','十四','十五','十六','十七','十八','十九','二十','廿一','廿二','廿三','廿四','廿五','廿六','廿七','廿八','廿九','三十'];
+
+// 二十四节气
+const SOLAR_TERMS = {
+  1: { 5:'小寒', 20:'大寒' },
+  2: { 4:'立春', 19:'雨水' },
+  3: { 5:'惊蛰', 20:'春分' },
+  4: { 5:'清明', 20:'谷雨' },
+  5: { 5:'立夏', 21:'小满' },
+  6: { 5:'芒种', 21:'夏至' },
+  7: { 7:'小暑', 23:'大暑' },
+  8: { 7:'立秋', 23:'处暑' },
+  9: { 7:'白露', 23:'秋分' },
+  10: { 8:'寒露', 23:'霜降' },
+  11: { 7:'立冬', 22:'小雪' },
+  12: { 7:'大雪', 22:'冬至' },
+};
+
+// 传统节日
+const LUNAR_FESTIVALS = {
+  '1-1': '春节',
+  '1-15': '元宵节',
+  '5-5': '端午节',
+  '7-7': '七夕节',
+  '7-15': '中元节',
+  '8-15': '中秋节',
+  '9-9': '重阳节',
+  '12-30': '除夕',
+};
+
+function lunarYearDays(y) {
+  let sum = 348;
+  for (let i = 0x8000; i > 0x8; i >>= 1) { sum += (LUNAR_INFO[y - 1900] & i) ? 1 : 0; }
+  return sum + leapDays(y);
+}
+function leapDays(y) { return LUNAR_INFO[y - 1900] & 0xf ? (LUNAR_INFO[y - 1900] & 0x10000 ? 30 : 29) : 0; }
+function leapMonth(y) { return LUNAR_INFO[y - 1900] & 0xf; }
+function monthDays(y, m) { return LUNAR_INFO[y - 1900] & (0x10000 >> m) ? 30 : 29; }
+
+function solarToLunar(y, m, d) {
+  const baseDate = new Date(1900, 0, 31);
+  const objDate  = new Date(y, m - 1, d);
+  let offset = Math.round((objDate - baseDate) / 86400000);
+
+  let ly = 1900, temp = 0;
+  for (; ly < 2050 && offset > 0; ly++) {
+    temp = lunarYearDays(ly);
+    offset -= temp;
+  }
+  if (offset < 0) { offset += temp; ly--; }
+
+  const leap = leapMonth(ly);
+  let isLeap = false;
+  let lm = 1;
+  for (; lm < 13 && offset > 0; lm++) {
+    if (leap > 0 && lm === leap + 1 && !isLeap) {
+      --lm; isLeap = true; temp = leapDays(ly);
+    } else {
+      temp = monthDays(ly, lm);
+    }
+    if (isLeap && lm === leap + 1) isLeap = false;
+    offset -= temp;
+  }
+  if (offset === 0 && leap > 0 && lm === leap + 1) {
+    if (isLeap) { isLeap = false; }
+    else { isLeap = true; --lm; }
+  }
+  if (offset < 0) { offset += temp; --lm; }
+
+  const ld = offset + 1;
+  return { year: ly, month: lm, day: ld, isLeap };
+}
+
+function updateCalendar() {
+  const now = new Date();
+  const y = now.getFullYear(), m = now.getMonth() + 1, d = now.getDate();
+  const weekdays = ['日','一','二','三','四','五','六'];
+  const solarStr = y + '年' + m + '月' + d + '日 星期' + weekdays[now.getDay()];
+  const lunar = solarToLunar(y, m, d);
+  const lunarStr = (lunar.isLeap ? '闰' : '') + LUNAR_MONTH_NAMES[lunar.month] + '月' + LUNAR_DAY_NAMES[lunar.day];
+  
+  const term = (SOLAR_TERMS[m] && SOLAR_TERMS[m][d]) || '';
+  const festival = LUNAR_FESTIVALS[lunar.month + '-' + lunar.day] || '';
+  
+  let extraInfo = '';
+  if (term) extraInfo = ' ' + term;
+  if (festival) extraInfo = ' ' + festival;
+  
+  const solarEl = document.getElementById('cal-solar');
+  const lunarEl = document.getElementById('cal-lunar');
+  if (solarEl) solarEl.textContent = solarStr;
+  if (lunarEl) lunarEl.textContent = ' ' + lunarStr + extraInfo;
+}
+function applyCalendarSettings() {
+  const cs = (CFG && CFG.calendarSettings) || {};
+  const box = document.getElementById('calendar-box');
+  if (box) box.style.display = cs.show === false ? 'none' : '';
+  updateCalendar();
 }
 
 const GREET_DEFAULTS = [
@@ -1556,14 +1886,6 @@ body{
 .nav-btn.active{background:#e8f0ff;color:var(--accent);font-weight:600}
 .nav-btn .nav-icon{font-size:1rem;width:20px;text-align:center;flex-shrink:0}
 .main-content{flex:1;overflow-y:auto;padding:28px 32px}
-.sticky-savebar{
-  position:sticky;top:0;z-index:60;
-  margin:0 -32px 18px;padding:10px 32px;
-  background:var(--bg);
-  border-bottom:1px solid var(--border);
-  display:flex;gap:12px;align-items:center;
-}
-.sticky-savebar .savebar-hint{font-size:.78rem;color:var(--muted)}
 .scroll-fab{
   position:fixed;right:14px;top:50%;transform:translateY(-50%);
   display:flex;flex-direction:column;gap:8px;z-index:9999;
@@ -1771,7 +2093,7 @@ input[type=color]{
   <div class="dash-header">
     <div class="dash-logo">cf<span>-nav</span></div>
     <span style="font-size:.7rem;color:var(--muted);margin-left:4px">管理后台</span>
-    <a href="/" target="_blank" rel="noreferrer" style="margin-left:8px;font-size:.78rem;color:var(--accent);text-decoration:none"> 查看导航页</a>
+    <a href="/" rel="noreferrer" style="margin-left:8px;font-size:.78rem;color:var(--accent);text-decoration:none"> 查看导航页</a>
     <button class="btn btn-sm" id="save-header-btn" style="margin-left:12px;display:none">保存</button>
     <div class="dash-user" id="dash-username"></div>
     <button class="btn-logout" id="logout-btn">退出登录</button>
@@ -1796,11 +2118,6 @@ input[type=color]{
         <div class="panel-header">
           <div class="panel-title">🎨 外观设置</div>
           <div class="panel-desc">自定义导航页的视觉风格与搜索引擎</div>
-        </div>
-
-        <div class="sticky-savebar">
-          <button class="btn" id="save-appearance">保存外观设置</button>
-          <span class="savebar-hint">改动后点此保存（始终固定在顶部）</span>
         </div>
 
         <div class="card">
@@ -1871,7 +2188,14 @@ input[type=color]{
               <input class="form-input" id="site-title" placeholder="我的导航"/>
             </div>
           </div>
-          <label class="form-group-inline" style="cursor:pointer;margin-top:4px">
+          <div class="form-group" style="margin-top:12px">
+            <label class="form-label">链接与搜索打开方式</label>
+            <select class="form-select" id="open-target">
+              <option value="_self">在当前页直接打开 (_self)</option>
+              <option value="_blank" disabled>在新标签页打开 (_blank) [已禁用]</option>
+            </select>
+          </div>
+          <label class="form-group-inline" style="cursor:pointer;margin-top:12px">
             <input type="checkbox" id="show-admin-link" checked/>
             <span style="margin-left:8px;font-size:.85rem">在导航页显示管理入口</span>
           </label>
@@ -1937,12 +2261,46 @@ input[type=color]{
         </div>
 
         <div class="card">
+          <div class="card-title">🌦 天气设置</div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">显示天气</label>
+              <label class="form-switch">
+                <input type="checkbox" id="weather-show" checked>
+                <span class="form-switch-slider"></span>
+              </label>
+            </div>
+            <div class="form-group">
+              <label class="form-label">城市名称</label>
+              <input class="form-input" id="weather-city" placeholder="如：北京" value="大庆">
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">📅 农历日历</div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">显示农历</label>
+              <label class="form-switch">
+                <input type="checkbox" id="calendar-show" checked>
+                <span class="form-switch-slider"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
           <div class="card-title">🎨 自定义 CSS</div>
           <div class="form-group">
             <label class="form-label">注入自定义 CSS 样式（会应用到导航页）</label>
             <textarea class="form-input" id="custom-css" rows="6" style="font-family:monospace;font-size:.82rem;resize:vertical" placeholder="例如：&#10;.site-card { border-radius: 8px; }&#10;.clock-time { font-size: 4rem; }"></textarea>
             <div class="form-hint">支持任意 CSS 规则，保存后即时生效</div>
           </div>
+        </div>
+
+        <div style="margin-top:20px;margin-bottom:36px;display:flex;justify-content:flex-end">
+          <button class="btn btn-sm" id="save-appearance" style="padding:10px 24px;font-size:.9rem">保存外观设置</button>
         </div>
       </div>
 
@@ -2150,6 +2508,7 @@ input[type=color]{
 let TOKEN = localStorage.getItem('nav_token') || '';
 let CFG   = null;
 let REG   = { mode:'closed', inviteCode:'' };
+let IS_OWNER = true;
 let editingQuickIdx  = -1;
 let editingSiteRef   = null;
 let editingCatIdx    = -1;
@@ -2178,7 +2537,8 @@ function faviconUrl(siteUrl) {
 
 function itemIconHtml(item) {
   const ico = (item.icon || '').trim();
-  if (ico.startsWith('data:')) return '<img src="' + escAttr(ico) + '" alt=""/>';
+  // FIX: 自定义图标 URL（非 data:）原来会被忽略、退化成 favicon
+  if (ico.startsWith('data:') || /^https?:\\/\\//i.test(ico)) return '<img src="' + escAttr(ico) + '" loading="lazy" onerror="this.style.opacity=\\'0\\'" alt=""/>';
   const fav = faviconUrl(item.url || '');
   return fav ? '<img src="' + fav + '" loading="lazy" onerror="this.style.opacity=\\'0\\'" alt=""/>' : '🔗';
 }
@@ -2316,9 +2676,27 @@ async function loadConfig() {
 }
 async function loadRegConfig() {
   try {
-    const st = await fetch('/api/status').then(r=>r.json());
+    const st = await fetch('/api/status', { headers: { 'Authorization': 'Bearer ' + TOKEN } }).then(r=>r.json());
     REG.mode = st.registerMode || 'closed';
+    // FIX: 原来这里从不读取 inviteCode，后台「注册权限」里的邀请码框永远是空的，
+    // 一旦点「保存注册设置」就把真实邀请码覆盖成空串，所有邀请码当场失效。
+    if (st.inviteCode !== undefined) REG.inviteCode = st.inviteCode || '';
+    IS_OWNER = st.isOwner !== false;
+    applyOwnerOnlyUI();
   } catch(e) {}
+}
+
+// FIX: 注册权限 / 重置配置 现在仅所有者可用，普通注册账号隐藏对应控件，避免点了报 403
+function applyOwnerOnlyUI() {
+  const regCard = document.getElementById('reg-mode');
+  const resetBtn = document.getElementById('reset-btn');
+  const pwCard = document.getElementById('save-password');
+  if (regCard) regCard.closest('.card').style.opacity = IS_OWNER ? '' : '.55';
+  if (regCard) regCard.disabled = !IS_OWNER;
+  if (document.getElementById('gen-invite')) document.getElementById('gen-invite').disabled = !IS_OWNER;
+  if (document.getElementById('save-reg')) document.getElementById('save-reg').disabled = !IS_OWNER;
+  if (resetBtn) { resetBtn.disabled = !IS_OWNER; resetBtn.title = IS_OWNER ? '' : '仅站点所有者可重置'; }
+  if (pwCard) pwCard.textContent = IS_OWNER ? '更新密码' : '更新我的密码';
 }
 async function saveConfig(patch) {
   const toSave = { ...CFG, ...patch };
@@ -2329,11 +2707,31 @@ async function saveConfig(patch) {
 }
 
 function renderAll() {
+  // FIX: CFG 为 null 时 renderAppearance() 会 return，但紧接着的
+  // renderWeatherControls() 直接读 CFG.weatherSettings → TypeError，整个后台白屏。
+  if (!CFG) { toast('配置加载失败，请刷新重试', 'err'); return; }
+  // FIX: 导入的配置若缺字段，后续 push 会抛错，这里统一兜底
+  CFG.quickLinks = Array.isArray(CFG.quickLinks) ? CFG.quickLinks : [];
+  CFG.categories = Array.isArray(CFG.categories) ? CFG.categories : [];
+  CFG.engines    = (Array.isArray(CFG.engines) && CFG.engines.length) ? CFG.engines : [];
   renderAppearance();
+  renderWeatherControls();
+  renderCalendarControls();
   renderEnginesList();
   renderQuickList();
   renderCatList();
   renderSettings();
+}
+
+function renderWeatherControls() {
+  const ws = CFG.weatherSettings || {};
+  document.getElementById('weather-show').checked = ws.show !== false;
+  document.getElementById('weather-city').value = ws.city || '';
+}
+
+function renderCalendarControls() {
+  const cs = CFG.calendarSettings || {};
+  document.getElementById('calendar-show').checked = cs.show !== false;
 }
 
 const CLOCK_ELEMS = [
@@ -2486,6 +2884,7 @@ function renderAppearance() {
   document.getElementById('bg-overlay-val').textContent = Math.round((bg.overlay||0)*100)+'%';
   document.getElementById('theme-select').value = CFG.theme||'light';
   document.getElementById('site-title').value   = CFG.siteTitle||'我的导航';
+  document.getElementById('open-target').value  = CFG.openTarget||'_self';
   document.getElementById('show-admin-link').checked = CFG.showAdminLink !== false;
 
   // Font settings
@@ -2500,6 +2899,14 @@ function renderAppearance() {
     document.getElementById('font-color').value = '#1d1d1f';
     document.getElementById('font-color-text').value = '';
   }
+
+  // Weather & Calendar settings
+  const ws = CFG.weatherSettings || {};
+  document.getElementById('weather-show').checked = ws.show !== false;
+  document.getElementById('weather-city').value = ws.city || '';
+  
+  const cs = CFG.calendarSettings || {};
+  document.getElementById('calendar-show').checked = cs.show !== false;
 
   document.getElementById('custom-css').value = CFG.customCSS || '';
   buildClockControls();
@@ -2625,6 +3032,7 @@ document.getElementById('save-header-btn').addEventListener('click', async () =>
 async function saveAppearanceSettings() {
   const theme      = document.getElementById('theme-select').value;
   const siteTitle  = document.getElementById('site-title').value.trim();
+  const openTarget = document.getElementById('open-target').value;
   const showAdminLink = document.getElementById('show-admin-link').checked;
   const searchEngine  = document.getElementById('default-engine').value;
   const blur    = document.getElementById('bg-blur').checked;
@@ -2650,7 +3058,7 @@ async function saveAppearanceSettings() {
   const customCSS = document.getElementById('custom-css').value || '';
 
   await saveConfig({
-    theme, siteTitle: siteTitle||'我的导航', showAdminLink, searchEngine,
+    theme, siteTitle: siteTitle||'我的导航', openTarget, showAdminLink, searchEngine,
     background: { type: activeTab, value: bgValue, blur, overlay },
     fontSettings: {
       size: Math.max(10, Math.min(24, fontSize)),
@@ -2682,13 +3090,16 @@ function renderQuickList() {
 }
 window.editQuick = function(i) {
   editingQuickIdx = i;
-  pendingQuickIcon = '';
   const q = CFG.quickLinks[i];
+  // FIX: 原来这里把 pendingQuickIcon 和输入框一起清空，
+  // 只想改个名字点保存，icon 就被算成 '' —— 已上传的自定义图标直接丢失。
+  const ico = (q.icon || '').trim();
+  pendingQuickIcon = ico.startsWith('data:') ? ico : '';
   document.getElementById('quick-modal-title').textContent = '编辑快速访问';
   document.getElementById('quick-name-input').value = q.name||'';
   document.getElementById('quick-url-input').value  = q.url||'';
-  document.getElementById('quick-icon-text').value  = '';
-  updateIconPreview('quick', q.icon||'', q.url);
+  document.getElementById('quick-icon-text').value  = (!pendingQuickIcon && ico) ? ico : '';
+  updateIconPreview('quick', ico, q.url);
   showModal('quick-modal');
 };
 document.getElementById('add-quick').addEventListener('click', () => {
@@ -2702,6 +3113,9 @@ document.getElementById('add-quick').addEventListener('click', () => {
   showModal('quick-modal');
 });
 window.delQuick = async function(i) {
+  // FIX: 后台删除原本没有二次确认，误点一下就直接写库
+  if(!confirm('确认删除该快速访问？')) return;
+  CFG.quickLinks = CFG.quickLinks || [];
   CFG.quickLinks.splice(i,1);
   renderQuickList();
   await saveConfig({ quickLinks: CFG.quickLinks });
@@ -2714,7 +3128,8 @@ document.getElementById('quick-modal-save').addEventListener('click', async () =
   const iconText = document.getElementById('quick-icon-text').value.trim();
   if(!name||!url){ toast('名称和URL不能为空','err'); return; }
   const icon = pendingQuickIcon || iconText || '';
-  const entry = { id: editingQuickIdx>=0?(CFG.quickLinks[editingQuickIdx].id||uid()):uid(), name, url, icon };
+  CFG.quickLinks = Array.isArray(CFG.quickLinks) ? CFG.quickLinks : [];
+  const entry = { id: editingQuickIdx>=0?((CFG.quickLinks[editingQuickIdx]||{}).id||uid()):uid(), name, url, icon };
   if(editingQuickIdx>=0) CFG.quickLinks[editingQuickIdx]=entry;
   else CFG.quickLinks.push(entry);
   renderQuickList();
@@ -2794,17 +3209,22 @@ window.addSite = function(ci) {
 };
 window.editSite = function(ci,si) {
   editingSiteRef = { catIdx:ci, siteIdx:si };
-  pendingSiteIcon = '';
   const s = CFG.categories[ci].sites[si];
+  // FIX: 同 editQuick —— 编辑时保留原有自定义图标，不再被静默清空
+  const ico = (s.icon || '').trim();
+  pendingSiteIcon = ico.startsWith('data:') ? ico : '';
   document.getElementById('site-modal-title').textContent = '编辑网站';
   document.getElementById('site-name').value = s.name||'';
   document.getElementById('site-url').value  = s.url||'';
   document.getElementById('site-desc').value = s.desc||'';
-  document.getElementById('site-icon-text').value = '';
-  updateIconPreview('site', s.icon||'', s.url);
+  document.getElementById('site-icon-text').value = (!pendingSiteIcon && ico) ? ico : '';
+  updateIconPreview('site', ico, s.url);
   showModal('site-modal');
 };
 window.delSite = async function(ci,si) {
+  if(!confirm('确认删除该网站？')) return;
+  if(!CFG.categories[ci]) return;
+  CFG.categories[ci].sites = CFG.categories[ci].sites || [];
   CFG.categories[ci].sites.splice(si,1);
   renderCatList();
   await saveConfig({ categories: CFG.categories });
@@ -2827,6 +3247,7 @@ document.getElementById('cat-modal-save').addEventListener('click', async ()=>{
     CFG.categories[editingCatIdx].name=name;
     CFG.categories[editingCatIdx].icon=icon;
   } else {
+    CFG.categories = Array.isArray(CFG.categories) ? CFG.categories : [];
     CFG.categories.push({ id:uid(), name, icon, sites:[] });
   }
   renderCatList();
@@ -2843,10 +3264,14 @@ document.getElementById('site-modal-save').addEventListener('click', async ()=>{
   const iconText=document.getElementById('site-icon-text').value.trim();
   if(!name||!url){ toast('名称和URL不能为空','err'); return; }
   const icon = pendingSiteIcon || iconText || '';
+  if(!editingSiteRef){ toast('请先选择要添加到的分类','err'); return; }
   const {catIdx,siteIdx} = editingSiteRef;
-  const entry = { id: siteIdx>=0?(CFG.categories[catIdx].sites[siteIdx].id||uid()):uid(), name, url, icon, desc };
-  if(siteIdx>=0) CFG.categories[catIdx].sites[siteIdx]=entry;
-  else CFG.categories[catIdx].sites.push(entry);
+  const cat = (CFG.categories||[])[catIdx];
+  if(!cat){ toast('目标分类不存在，请重试','err'); return; }
+  cat.sites = Array.isArray(cat.sites) ? cat.sites : [];
+  const entry = { id: siteIdx>=0?((cat.sites[siteIdx]||{}).id||uid()):uid(), name, url, icon, desc };
+  if(siteIdx>=0) cat.sites[siteIdx]=entry;
+  else cat.sites.push(entry);
   renderCatList();
   await saveConfig({ categories:CFG.categories });
   closeModal('site-modal');
@@ -2918,8 +3343,11 @@ document.getElementById('reset-btn').addEventListener('click', async ()=>{
 function updateIconPreview(type, iconVal, siteUrl) {
   const display = document.getElementById(type+'-icon-display');
   if(!display) return;
-  if(iconVal && iconVal.startsWith('data:')) {
-    display.innerHTML = '<img src="' + escAttr(iconVal) + '" style="width:100%;height:100%;object-fit:contain;padding:4px;border-radius:10px" alt=""/>';
+  const iv = (iconVal||'').trim();
+  // FIX: 自定义图标也可能是普通图片 URL，原实现只认 data:，
+  // 结果填了图片 URL 的站点在编辑弹窗里预览成网站 favicon，看起来像"图标丢了"。
+  if(iv.startsWith('data:') || /^https?:\\/\\//i.test(iv)) {
+    display.innerHTML = '<img src="' + escAttr(iv) + '" style="width:100%;height:100%;object-fit:contain;padding:4px;border-radius:10px" onerror="this.parentNode.textContent=\\'🌐\\'" alt=""/>';
     return;
   }
   const fav = faviconUrl(siteUrl || '');
